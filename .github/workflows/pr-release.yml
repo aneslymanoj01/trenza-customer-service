@@ -1,0 +1,314 @@
+name: PR to Release - Build, Test & Sonar
+
+on:
+  pull_request:
+    branches:
+      - 'release/**'
+      - 'release'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build
+        run: ./mvnw clean compile -DskipTests
+
+  test-and-coverage:
+    name: Unit Test & Coverage
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      coverage: ${{ steps.extract-coverage.outputs.coverage }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Tests with Jacoco
+        run: ./mvnw test
+
+      - name: Extract Coverage
+        id: extract-coverage
+        run: |
+          REPORT="target/site/jacoco/jacoco.csv"
+          if [ -f "$REPORT" ]; then
+            COVERED=$(tail -n +2 "$REPORT" | awk -F',' '{covered+=$5; missed+=$4} END {print covered}')
+            MISSED=$(tail -n +2 "$REPORT" | awk -F',' '{missed+=$4} END {print missed}')
+            TOTAL=$((COVERED + MISSED))
+            if [ "$TOTAL" -gt 0 ]; then
+              PCT=$(awk "BEGIN {printf \"%.1f\", ($COVERED/$TOTAL)*100}")
+            else
+              PCT="0.0"
+            fi
+            echo "coverage=$PCT" >> $GITHUB_OUTPUT
+          else
+            echo "coverage=N/A" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Jacoco Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
+
+      - name: Comment Coverage on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const coverage = '${{ steps.extract-coverage.outputs.coverage }}';
+            const body = [
+              '## 📊 Jacoco Coverage Report',
+              '',
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Line Coverage | **${coverage}%** |`,
+              '',
+              '> Full report available in workflow artifacts.'
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes('📊 Jacoco Coverage Report'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  owasp:
+    name: OWASP Dependency Check
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run OWASP Dependency Check
+        id: owasp
+        continue-on-error: true
+        run: |
+          ./mvnw org.owasp:dependency-check-maven:check \
+            -DfailBuildOnCVSS=7 \
+            -Dformat=HTML \
+            -DoutputDirectory=target/dependency-check
+
+      - name: Upload OWASP Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-report
+          path: target/dependency-check/
+
+      - name: Comment OWASP Result on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const outcome = '${{ steps.owasp.outcome }}';
+            const passed = outcome === 'success';
+
+            const commentBody = [
+              '## 🛡️ OWASP Dependency Check',
+              '',
+              `| | Result |`,
+              `|--|--------|`,
+              `| Vulnerabilities (CVSS ≥ 7) | **${passed ? '✅ None Found' : '❌ Issues Found'}** |`,
+              '',
+              passed
+                ? '> No high/critical vulnerabilities detected in dependencies.'
+                : '> ⚠️ High/critical vulnerabilities found. Check the report in workflow artifacts.'
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes('🛡️ OWASP Dependency Check'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody,
+              });
+            }
+
+            if (!passed) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                event: 'REQUEST_CHANGES',
+                body: [
+                  '## ❌ OWASP Dependency Check Failed',
+                  '',
+                  'High or critical vulnerabilities (CVSS ≥ 7) were detected in your dependencies.',
+                  '',
+                  '**Please address the following before this PR can be merged:**',
+                  '- Update or replace dependencies with known CVEs',
+                  '- Review the full OWASP report in the workflow artifacts',
+                  '- If a vulnerability is a false positive, add a suppression entry',
+                ].join('\n'),
+              });
+            }
+
+  sonar:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: test-and-coverage
+    if: always()
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Tests for Sonar
+        run: ./mvnw test
+
+      - name: SonarQube Scan
+        id: sonar
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          ./mvnw sonar:sonar \
+            -Dsonar.projectKey=<your-sonar-org>_trenza-customer-service \
+            -Dsonar.organization=<your-sonar-org> \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.token=$SONAR_TOKEN \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+
+      - name: Handle Sonar Result on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const outcome = '${{ steps.sonar.outcome }}';
+            const passed = outcome === 'success';
+            const sonarUrl = '${{ secrets.SONAR_HOST_URL }}';
+
+            const commentBody = [
+              '## 🔍 SonarQube Analysis',
+              '',
+              `| | Result |`,
+              `|--|--------|`,
+              `| Quality Gate | **${passed ? '✅ Passed' : '❌ Failed'}** |`,
+              '',
+              passed
+                ? `> [View full report on SonarQube](${sonarUrl})`
+                : '> ⚠️ Quality gate failed. Please address the issues below before this PR can be merged.'
+            ].join('\n');
+
+            // Update or create summary comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes('🔍 SonarQube Analysis'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody,
+              });
+            }
+
+            // Dismiss any previous bot reviews first
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            for (const review of reviews) {
+              if (review.user.type === 'Bot' && review.state === 'CHANGES_REQUESTED') {
+                await github.rest.pulls.dismissReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  review_id: review.id,
+                  message: 'Dismissing previous Sonar review.',
+                });
+              }
+            }
+
+            if (!passed) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                event: 'REQUEST_CHANGES',
+                body: [
+                  '## ❌ SonarQube Quality Gate Failed',
+                  '',
+                  'This PR cannot be merged until the SonarQube quality gate passes.',
+                  '',
+                  '**Please address the following before requesting a review:**',
+                  '- Fix all blocker and critical issues reported by SonarQube',
+                  '- Ensure code coverage meets the minimum threshold',
+                  '- Resolve any code smells or security vulnerabilities flagged',
+                  '',
+                  `> [View detailed issues on SonarQube](${sonarUrl})`,
+                ].join('\n'),
+              });
+            }
